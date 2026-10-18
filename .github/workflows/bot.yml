@@ -1,0 +1,26 @@
+name: discord-bot
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # 30분마다 "다음 실행"을 대기열에 넣어 공백 없이 이어받게 함
+  workflow_dispatch:
+
+# 동시에 1개만 실행. 새 실행은 대기(취소 X) → 현재 봇이 끝나면 바로 이어서 시작
+concurrency:
+  group: discord-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-audit --no-fund
+      - run: node bot.js
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
