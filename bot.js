@@ -23,9 +23,18 @@ if (!DISCORD_TOKEN || !CLIENT_ID) {
 let cache = { at: 0, data: null };
 async function getState() {
   if (cache.data && Date.now() - cache.at < 60_000) return cache.data;
-  const r = await fetch(`${DATA_URL}?t=${Date.now()}`);
-  if (!r.ok) throw new Error(`Failed to load data (HTTP ${r.status})`);
-  cache = { at: Date.now(), data: await r.json() };
+  try {
+    const r = await fetch(`${DATA_URL}?t=${Date.now()}`, { signal: AbortSignal.timeout(15_000) });
+    if (!r.ok) throw new Error(`Failed to load data (HTTP ${r.status})`);
+    cache = { at: Date.now(), data: await r.json() };
+  } catch (e) {
+    // remote file broken/unreachable: keep serving the last good copy
+    if (cache.data) {
+      console.error('using stale data:', e.message);
+      return cache.data;
+    }
+    throw new Error('Data is temporarily unavailable');
+  }
   return cache.data;
 }
 
@@ -34,6 +43,9 @@ const HOUR = 3_600_000;
 const pad = n => String(n).padStart(2, '0');
 const fmt = n => Math.round(n).toLocaleString('en-US');
 const sign = n => (n >= 0 ? `+${fmt(n)}` : fmt(n));
+const esc = s => String(s).replace(/([\\*_~`|>])/g, '\\$1');
+const NO_PING = { parse: [] };
+const CHUNK = 3500; // embed description limit is 4096
 
 const hourLabel = k => {
   const h = Number(k.slice(11, 13));
@@ -64,23 +76,30 @@ function findPlayer(state, q) {
   return name ? [name, state.players[name]] : null;
 }
 
-/** Sends a code-block table; overflow goes into public follow-up messages. */
-async function sendTable(i, { content, title, header, rows, color }) {
+/**
+ * Mobile-friendly list: each entry is a short text block (no padded code-block table,
+ * which scrolls sideways / breaks on phones). Overflow goes into public follow-ups.
+ */
+async function sendList(i, { content, title, entries, empty, color }) {
   const chunks = [];
-  let cur = header;
-  for (const row of rows) {
-    if ((cur + '\n' + row).length > 3800) { chunks.push(cur); cur = header; }
-    cur += '\n' + row;
+  let cur = '';
+  for (const e of entries) {
+    if (cur && (cur + '\n' + e).length > CHUNK) { chunks.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + e;
   }
-  chunks.push(cur);
+  if (cur) chunks.push(cur);
+  if (!chunks.length) chunks.push(empty ?? 'No data.');
+
   const embed = (c, idx) => new EmbedBuilder().setColor(color)
     .setTitle(idx === 0 ? title : `${title} (cont.)`)
-    .setDescription('```\n' + c + '\n```');
-  await i.editReply({ content, embeds: [embed(chunks[0], 0)] });
-  for (let n = 1; n < chunks.length; n++) await i.followUp({ embeds: [embed(chunks[n], n)] });
+    .setDescription(c);
+  await i.editReply({ content, embeds: [embed(chunks[0], 0)], allowedMentions: NO_PING });
+  for (let n = 1; n < chunks.length; n++) {
+    await i.followUp({ embeds: [embed(chunks[n], n)], allowedMentions: NO_PING });
+  }
 }
 
-const updatedLine = s => `Data updated <t:${Math.floor(s.updated / 1000)}:R>`;
+const updatedLine = s => (s.updated ? `Data updated <t:${Math.floor(s.updated / 1000)}:R>` : '');
 
 /* --------------------------- commands ----------------------------- */
 const SORTS = [
@@ -125,15 +144,19 @@ async function handle(i) {
     const [name, p] = found;
     const n = i.options.getInteger('hours') ?? 24;
     const keys = Object.keys(p.hours ?? {}).sort().reverse().slice(0, n);
-    const header = `${'Hour (KST)'.padEnd(17)}${'RWPH'.padStart(5)}${'Gain'.padStart(8)}${'Jumps'.padStart(6)}`;
-    const rows = keys.map(k => {
+    const entries = keys.map(k => {
       const h = p.hours[k];
       const j = jumpsAt(p, k);
-      return `${hourLabel(k).padEnd(17)}${String(h.count).padStart(5)}${sign(h.gain).padStart(8)}${(j ? String(j) : '-').padStart(6)}`;
+      return `**${hourLabel(k)}**\n└ RWPH \`${fmt(h.count || 0)}\` · wave \`${sign(h.gain || 0)}\` · JUMP \`${j || '-'}\``;
     });
-    return sendTable(i, {
-      content: `**${name}** · ${p.guild} · Score ${fmt(p.lastScore)} · Season jumps ${p.jumps?.total ?? 0}\n${updatedLine(state)}`,
-      title: 'Hourly stats', header, rows, color: 0x5865f2,
+    return sendList(i, {
+      content: [
+        `**${esc(name)}** · ${esc(p.guild ?? '-')}`,
+        `Score **${fmt(p.lastScore ?? 0)}**`,
+        `Season jumps **${p.jumps?.total ?? 0}**`,
+        updatedLine(state),
+      ].filter(Boolean).join('\n'),
+      title: 'Hourly stats', entries, empty: 'No hourly data yet.', color: 0x5865f2,
     });
   }
 
@@ -143,15 +166,20 @@ async function handle(i) {
     const [name, p] = found;
     const past = [...(p.past ?? [])].reverse(); // newest first
     const cur = p.jumps?.total ?? 0;
-    const head = `**${name}** · ${p.guild}\nCurrent season jumps: **${cur}** (j10 ${p.jumps?.j10 ?? 0} / j20 ${p.jumps?.j20 ?? 0} / j30 ${p.jumps?.j30 ?? 0})`;
-    if (!past.length) return i.editReply(`${head}\nNo past-season records.`);
+    const head = [
+      `**${esc(name)}** · ${esc(p.guild ?? '-')}`,
+      `Current season jumps: **${cur}**`,
+      `j10 **${p.jumps?.j10 ?? 0}** · j20 **${p.jumps?.j20 ?? 0}** · j30 **${p.jumps?.j30 ?? 0}**`,
+    ];
+    if (!past.length) {
+      return i.editReply({ content: `${head.join('\n')}\nNo past-season records.`, allowedMentions: NO_PING });
+    }
     const total = past.reduce((a, s) => a + (s.total || 0), 0);
-    const header = `${'Season (KST)'.padEnd(15)}${'Final Wave'.padStart(11)}${'Jumps'.padStart(7)}`;
-    const rows = past.map(s =>
-      `${`${kstDay(s.start)} ~ ${kstDay(s.end)}`.padEnd(15)}${String(s.wave).padStart(11)}${String(s.total).padStart(7)}`);
-    return sendTable(i, {
-      content: `${head}\nPast seasons total: **${total}**`,
-      title: 'Past seasons', header, rows, color: 0xf39c12,
+    const entries = past.map(s =>
+      `**${kstDay(s.start)} ~ ${kstDay(s.end)}**\n└ Final wave \`${fmt(s.wave || 0)}\` · Jumps \`${s.total || 0}\``);
+    return sendList(i, {
+      content: `${head.join('\n')}\nPast seasons total: **${total}**`,
+      title: 'Past seasons', entries, color: 0xf39c12,
     });
   }
 
@@ -167,7 +195,8 @@ async function handle(i) {
 
     if (!members.length) {
       const all = [...new Set(Object.values(state.players).map(p => p.guild))].sort().join(', ');
-      return i.editReply(`No members found for **${gName}**. Available guilds: ${all}`);
+      const msg = `No members found for **${gName}**.\nAvailable guilds: ${all}`;
+      return i.editReply({ content: msg.slice(0, 1900), allowedMentions: NO_PING });
     }
 
     const val = { score: m => m.score, rwph: m => m.rwph, gain: m => m.gain, jumps: m => m.jumps };
@@ -176,19 +205,22 @@ async function handle(i) {
       : val[sort](a) - val[sort](b));
     if (order === 'desc') members.reverse();
 
-    const w = Math.min(16, Math.max(6, ...members.map(m => m.name.length)));
-    const header = `${'#'.padEnd(3)}${'Player'.padEnd(w + 1)}${'Score'.padStart(7)}${'RWPH'.padStart(6)}${'Gain'.padStart(9)}${'Jumps'.padStart(6)}`;
-    const rows = members.map((m, idx) =>
-      `${String(idx + 1).padEnd(3)}${m.name.slice(0, w).padEnd(w + 1)}${fmt(m.score).padStart(7)}${fmt(m.rwph).padStart(6)}${sign(m.gain).padStart(9)}${String(m.jumps).padStart(6)}`);
+    const entries = members.map((m, idx) =>
+      `**${idx + 1}. ${esc(m.name)}**\n`
+      + `└ ${fmt(m.score)} · RWPH \`${fmt(m.rwph)}\` · \`${sign(m.gain)}\` · JUMP \`${m.jumps}\``);
 
     const totGain = members.reduce((a, m) => a + m.gain, 0);
     const totJumps = members.reduce((a, m) => a + m.jumps, 0);
     const sortName = SORTS.find(s => s.value === sort).name;
-    return sendTable(i, {
-      content: `**${gName}** · ${members.length} members · 24h Gain ${sign(totGain)} · Season jumps ${totJumps}\n`
-        + `Score = season wave · RWPH / Gain = 24h totals (last 24 hourly buckets) · ${updatedLine(state)}`,
-      title: `${gName} — sorted by ${sortName} (${order === 'desc' ? 'high → low' : 'low → high'})`,
-      header, rows, color: 0x2ecc71,
+    return sendList(i, {
+      content: [
+        `**${gName}** · ${members.length} members`,
+        `24h Gain **${sign(totGain)}** · Season jumps **${totJumps}**`,
+        `Per player: Score · RWPH · Gain · JUMP (24h totals)`,
+        updatedLine(state),
+      ].filter(Boolean).join('\n'),
+      title: `${gName} — by ${sortName} (${order === 'desc' ? 'high → low' : 'low → high'})`,
+      entries, color: 0x2ecc71,
     });
   }
 }
@@ -201,7 +233,11 @@ client.once('ready', async () => {
   await registerCommands();
   // GitHub Actions jobs max out at 6h: exit cleanly after 350 min so the queued run takes over
   const lifetime = Number(process.env.BOT_LIFETIME_MIN ?? 350) * 60_000;
-  setTimeout(async () => { console.log('Lifetime reached, restarting via next run.'); await client.destroy(); process.exit(0); }, lifetime);
+  setTimeout(async () => {
+    console.log('Lifetime reached, restarting via next run.');
+    await client.destroy();
+    process.exit(0);
+  }, lifetime);
 });
 
 client.on('interactionCreate', async i => {
